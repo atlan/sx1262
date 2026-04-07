@@ -190,7 +190,7 @@ void sx1262_interface_debug_print(const char *const fmt, ...)
     vsnprintf((char *)str, 255, (char const *)fmt, args);
     va_end(args);
     
-    (void)printf((uint8_t *)str);
+    fputs(str, stdout);
 }
 
 /**
