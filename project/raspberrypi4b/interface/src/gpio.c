@@ -1,6 +1,6 @@
 /**
  * Copyright (c) 2015 - present LibDriver All rights reserved
- * 
+ *
  * The MIT License (MIT)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,10 +19,10 @@
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE. 
+ * SOFTWARE.
  *
  * @file      gpio.c
- * @brief     gpio source file
+ * @brief     gpio source file (libgpiod v2 API)
  * @version   1.0.0
  * @author    Shifeng Li
  * @date      2022-11-11
@@ -51,10 +51,11 @@
 /**
  * @brief global var definition
  */
-static struct gpiod_chip *gs_chip;        /**< gpio chip handle */
-static struct gpiod_line *gs_line;        /**< gpio line handle */
-static pthread_t gs_pid;                  /**< gpio pthread pid */
-extern uint8_t (*g_gpio_irq)(void);       /**< gpio irq */
+static struct gpiod_chip *gs_chip;                        /**< gpio chip handle */
+static struct gpiod_line_request *gs_line_request;        /**< gpio line request handle */
+static struct gpiod_edge_event_buffer *gs_event_buffer;   /**< gpio edge event buffer */
+static pthread_t gs_pid;                                  /**< gpio pthread pid */
+extern uint8_t (*g_gpio_irq)(void);                       /**< gpio irq */
 
 /**
  * @brief  gpio interrupt pthread
@@ -65,8 +66,8 @@ extern uint8_t (*g_gpio_irq)(void);       /**< gpio irq */
 static void *a_gpio_interrupt_pthread(void *p)
 {
     int res;
-    struct gpiod_line_event event;
-    
+    struct gpiod_edge_event *event;
+
     /* enable catching cancel signal */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
@@ -76,18 +77,22 @@ static void *a_gpio_interrupt_pthread(void *p)
     /* loop */
     while (1)
     {
-        /* wait for the event */
-        res = gpiod_line_event_wait(gs_line, NULL);
+        /* wait for the event (negative timeout = wait indefinitely) */
+        res = gpiod_line_request_wait_edge_events(gs_line_request, -1);
         if (res == 1)
         {
             /* read the event */
-            if (gpiod_line_event_read(gs_line, &event) != 0)
+            res = gpiod_line_request_read_edge_events(gs_line_request, gs_event_buffer, 1);
+            if (res < 1)
             {
                 continue;
             }
 
+            /* get the first event */
+            event = gpiod_edge_event_buffer_get_event(gs_event_buffer, 0);
+
             /* if the rising edge */
-            if (event.event_type == GPIOD_LINE_EVENT_RISING_EDGE)
+            if (gpiod_edge_event_get_event_type(event) == GPIOD_EDGE_EVENT_RISING_EDGE)
             {
                 /* check the g_gpio_irq */
                 if (g_gpio_irq != NULL)
@@ -109,9 +114,13 @@ static void *a_gpio_interrupt_pthread(void *p)
  */
 uint8_t gpio_interrupt_init(void)
 {
-    uint8_t res;
-    
-    /* open the gpio group */
+    int res;
+    unsigned int offset = GPIO_DEVICE_LINE;
+    struct gpiod_request_config *req_cfg = NULL;
+    struct gpiod_line_config *line_cfg = NULL;
+    struct gpiod_line_settings *settings = NULL;
+
+    /* open the gpio chip */
     gs_chip = gpiod_chip_open(GPIO_DEVICE_NAME);
     if (gs_chip == NULL)
     {
@@ -119,31 +128,83 @@ uint8_t gpio_interrupt_init(void)
 
         return 1;
     }
-    
-    /* get the gpio line */
-    gs_line = gpiod_chip_get_line(gs_chip, GPIO_DEVICE_LINE);
-    if (gs_line == NULL) 
+
+    /* configure line settings: input with rising edge detection */
+    settings = gpiod_line_settings_new();
+    if (settings == NULL)
     {
-        perror("gpio: get line failed.\n");
+        perror("gpio: line settings alloc failed.\n");
+        gpiod_chip_close(gs_chip);
+
+        return 1;
+    }
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_RISING);
+
+    /* build line config */
+    line_cfg = gpiod_line_config_new();
+    if (line_cfg == NULL)
+    {
+        perror("gpio: line config alloc failed.\n");
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(gs_chip);
+
+        return 1;
+    }
+    if (gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings) < 0)
+    {
+        perror("gpio: add line settings failed.\n");
+        gpiod_line_settings_free(settings);
+        gpiod_line_config_free(line_cfg);
+        gpiod_chip_close(gs_chip);
+
+        return 1;
+    }
+    gpiod_line_settings_free(settings);
+
+    /* build request config */
+    req_cfg = gpiod_request_config_new();
+    if (req_cfg == NULL)
+    {
+        perror("gpio: request config alloc failed.\n");
+        gpiod_line_config_free(line_cfg);
+        gpiod_chip_close(gs_chip);
+
+        return 1;
+    }
+    gpiod_request_config_set_consumer(req_cfg, "gpiointerrupt");
+
+    /* request the line */
+    gs_line_request = gpiod_chip_request_lines(gs_chip, req_cfg, line_cfg);
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+
+    if (gs_line_request == NULL)
+    {
+        perror("gpio: request line failed.\n");
         gpiod_chip_close(gs_chip);
 
         return 1;
     }
 
-    /* catch the rising edge */
-    if (gpiod_line_request_rising_edge_events(gs_line, "gpiointerrupt") < 0)
+    /* allocate event buffer (capacity 1) */
+    gs_event_buffer = gpiod_edge_event_buffer_new(1);
+    if (gs_event_buffer == NULL)
     {
-        perror("gpio: set edge events failed.\n");
+        perror("gpio: event buffer alloc failed.\n");
+        gpiod_line_request_release(gs_line_request);
         gpiod_chip_close(gs_chip);
 
         return 1;
     }
 
-    /* creat a gpio interrupt pthread */
+    /* create a gpio interrupt pthread */
     res = pthread_create(&gs_pid, NULL, a_gpio_interrupt_pthread, NULL);
     if (res != 0)
     {
-        perror("gpio: creat pthread failed.\n");
+        perror("gpio: create pthread failed.\n");
+        gpiod_edge_event_buffer_free(gs_event_buffer);
+        gpiod_line_request_release(gs_line_request);
         gpiod_chip_close(gs_chip);
 
         return 1;
@@ -161,8 +222,8 @@ uint8_t gpio_interrupt_init(void)
  */
 uint8_t gpio_interrupt_deinit(void)
 {
-    uint8_t res;
-    
+    int res;
+
     /* close the gpio interrupt pthread */
     res = pthread_cancel(gs_pid);
     if (res != 0)
@@ -172,8 +233,14 @@ uint8_t gpio_interrupt_deinit(void)
         return 1;
     }
 
-    /* close the gpio */
+    /* free event buffer */
+    gpiod_edge_event_buffer_free(gs_event_buffer);
+
+    /* release the line request */
+    gpiod_line_request_release(gs_line_request);
+
+    /* close the gpio chip */
     gpiod_chip_close(gs_chip);
-    
+
     return 0;
 }
